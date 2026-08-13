@@ -625,7 +625,7 @@ function renderDashboard(d) {
       </div>
     </div>
     <div class="tooltip">Data Yahoo Finance · delay 15 menit</div>`;
-  if (d.ihsg_chart && d.ihsg_chart.length) setTimeout(() => renderIhsgChart(d.ihsg_chart, 'hari'), 100);
+  if (d.ihsg_chart && d.ihsg_chart.length) setTimeout(() => renderIhsgChart(d.ihsg_chart, 'tahun'), 100);
 }
 
 function renderOverview(ih) {
@@ -672,27 +672,33 @@ async function switchIhsgRange(range) {
 function renderIhsgChart(data, range) {
   const c = document.getElementById('ihsgChart');
   if (!c) return;
-  if (ihsgChart) { ihsgChart.remove(); ihsgChart = null; }
+  if (ihsgChart) { try { ihsgChart.remove(); } catch(e) {} ihsgChart = null; }
+  c.innerHTML = '';  // clear loading state
+
   const isDaily = (range === 'bulan' || range === 'tahun');
-  ihsgChart = LightweightCharts.createChart(c, {
-    layout: { background: { color: '#ffffff' }, textColor: '#333' },
-    grid: { vertLines: { color: '#f0f0f0' }, horzLines: { color: '#f0f0f0' } },
-    rightPriceScale: { borderColor: '#e0e0e0', scaleMargins: { top: .05, bottom: .05 } },
-    timeScale: { borderColor: '#e0e0e0', timeVisible: !isDaily, secondsVisible: false },
-  });
-  const area = ihsgChart.addAreaSeries({
-    lineColor: '#059669', topColor: 'rgba(5,150,105,0.12)',
-    bottomColor: 'rgba(5,150,105,0.01)', lineWidth: 2,
-  });
-  area.setData(data.map(d => ({ time: d.time, value: d.close })));
-  // Overlay MA20/MA50 only on daily ranges (intraday MA is misleading)
-  if (isDaily && data.length >= 50) {
-    const m20 = MA(data, 20);
-    if (m20.length) ihsgChart.addLineSeries({ color: '#1d4ed8', lineWidth: 1, lastValueVisible: false }).setData(m20);
-    const m50 = MA(data, 50);
-    if (m50.length) ihsgChart.addLineSeries({ color: '#f59e0b', lineWidth: 1, lastValueVisible: false }).setData(m50);
+  try {
+    ihsgChart = LightweightCharts.createChart(c, {
+      layout: { background: { color: '#ffffff' }, textColor: '#333' },
+      grid: { vertLines: { color: '#f0f0f0' }, horzLines: { color: '#f0f0f0' } },
+      rightPriceScale: { borderColor: '#e0e0e0', scaleMargins: { top: .05, bottom: .05 } },
+      timeScale: { borderColor: '#e0e0e0', timeVisible: !isDaily, secondsVisible: false },
+    });
+    const area = ihsgChart.addAreaSeries({
+      lineColor: '#059669', topColor: 'rgba(5,150,105,0.12)',
+      bottomColor: 'rgba(5,150,105,0.01)', lineWidth: 2,
+    });
+    area.setData(data.map(d => ({ time: d.time, value: d.close })));
+    // Overlay MA20/MA50 only on daily ranges (intraday MA is misleading)
+    if (isDaily && data.length >= 50) {
+      const m20 = MA(data, 20);
+      if (m20.length) ihsgChart.addLineSeries({ color: '#1d4ed8', lineWidth: 1, lastValueVisible: false }).setData(m20);
+      const m50 = MA(data, 50);
+      if (m50.length) ihsgChart.addLineSeries({ color: '#f59e0b', lineWidth: 1, lastValueVisible: false }).setData(m50);
+    }
+    ihsgChart.timeScale().fitContent();
+  } catch(e) {
+    c.innerHTML = `<div style="text-align:center;padding:60px;color:#dc2626;font-size:12px;">Gagal render grafik: ${e.message}</div>`;
   }
-  ihsgChart.timeScale().fitContent();
 }
 
 // Calculate Simple Moving Average from OHLCV data

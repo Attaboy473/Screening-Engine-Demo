@@ -692,8 +692,13 @@ async def ihsg_chart_api(range: str = Query("hari", description="hari|minggu|bul
 
         data = []
         for idx, row in df.iterrows():
+            # Normalize timestamps: daily bars -> UTC midnight (avoids off-by-one day
+            # at browser in UTC+X timezones); intraday bars stay as Unix seconds.
+            ts = int(pd.Timestamp(idx).timestamp())
+            if cfg["interval"] == "1d":
+                ts = int(pd.Timestamp(idx).replace(hour=0, minute=0, second=0).timestamp())
             data.append({
-                "time":   int(pd.Timestamp(idx).timestamp()),
+                "time":   ts,
                 "open":   safe(float(row["Open"])),
                 "high":   safe(float(row["High"])),
                 "low":    safe(float(row["Low"])),
