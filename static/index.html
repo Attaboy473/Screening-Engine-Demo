@@ -950,6 +950,36 @@ window.closeModal = function() {
 let recData = [];
 let recFilter = 'Semua';
 
+// ── "Return sejak direkomendasikan" tracking (localStorage) ──
+// Setiap saham yang muncul di rekomendasi dicatat harga + tanggal pertama kali.
+// Pada render berikutnya, kita tampilkan return sejak saat itu (trust builder).
+const REC_KEY = 'demo_rec_history';
+
+function getRecHistory() {
+  try {
+    const raw = localStorage.getItem(REC_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch(e) { return {}; }
+}
+
+function saveRecHistory(h) {
+  try { localStorage.setItem(REC_KEY, JSON.stringify(h)); } catch(e) {}
+}
+
+// Catat saham ke history kalau belum pernah direkomendasikan.
+// Return: { sinceDate, sincePrice, retPct } — retPct null kalau baru pertama kali.
+function trackRec(kode, harga) {
+  const hist = getRecHistory();
+  if (!hist[kode]) {
+    hist[kode] = { price: harga, date: new Date().toISOString().slice(0, 10) };
+    saveRecHistory(hist);
+    return { sinceDate: hist[kode].date, sincePrice: harga, retPct: null };
+  }
+  const sincePrice = hist[kode].price;
+  const retPct = sincePrice > 0 ? (harga / sincePrice - 1) * 100 : null;
+  return { sinceDate: hist[kode].date, sincePrice, retPct };
+}
+
 function renderBatch(data) {
   const raw = Array.isArray(data) ? data : (data && data.data ? data.data : data);
   const valid  = Array.isArray(raw) ? raw.filter(d => !d.error) : [];
@@ -982,6 +1012,17 @@ function renderBatch(data) {
     const rcMap = {'STRONG BUY':'bs','BUY':'bb','HOLD':'bh','WATCH':'bw','AVOID':'ba'};
     const gcMap = {'A':'ga','B':'gb','C':'gc','D':'gd'};
 
+    // "Return sejak direkomendasikan" — track & display
+    const since = trackRec(d.kode, d.harga);
+    let sinceHtml = '';
+    if (since.retPct != null) {
+      const sSign = since.retPct >= 0 ? '+' : '';
+      const sCol  = since.retPct >= 0 ? '#059669' : '#dc2626';
+      sinceHtml = `<span class="rs-since" style="color:${sCol};font-size:10px;font-weight:600;flex:0 0 150px;text-align:right;white-space:nowrap;" title="Direkomendasikan ${since.sinceDate} @ Rp${since.sincePrice.toLocaleString('id-ID')}">${sSign}${since.retPct.toFixed(2)}% sejak rekom</span>`;
+    } else {
+      sinceHtml = `<span class="rs-since" style="color:#aaa;font-size:9px;flex:0 0 150px;text-align:right;white-space:nowrap;" title="Baru direkomendasikan hari ini">baru direkom</span>`;
+    }
+
     h += `<div class="rs-card">
       <span class="rs-kode" onclick="event.stopPropagation();searchSingle('${d.kode}')">${d.kode}</span>
       <span class="rs-score" style="color:${d.score>=80?'#059669':d.score>=63?'#0ea5e9':'#f59e0b'}">${d.score}</span>
@@ -991,6 +1032,7 @@ function renderBatch(data) {
       <span class="rs-g"><span class="rs-grade ${gcMap[d.grade]}"><span class="gr">grade</span> ${d.grade}</span></span>
       <button class="rs-analisis-btn" onclick="event.stopPropagation();showAnalisisPopup('${d.kode}')">Analisis</button>
       <button class="rs-analisis-btn" style="background:#f0fdf4;border-color:#a7f3d0;color:#059669;margin-left:4px;" onclick="event.stopPropagation();showBuyModal('${d.kode}',${d.harga})">Beli</button>
+      ${sinceHtml}
     </div>`;
   });
   h += '</div>';
@@ -1012,8 +1054,24 @@ const PORTO_KEY = 'demo_portfolio';
 // Default: 100 juta rupiah virtual
 function getPortfolio() {
   const raw = localStorage.getItem(PORTO_KEY);
-  if (raw) return JSON.parse(raw);
-  return { balance: 100_000_000, positions: [] };
+  if (raw) {
+    const p = JSON.parse(raw);
+    // Migrate: pastikan ada transactions + positions pakai skema baru
+    if (!Array.isArray(p.transactions)) p.transactions = [];
+    p.positions = (p.positions || []).map(pos => {
+      // Skema lama: entryPrice/entryDate. Skema baru: avgPrice/firstDate.
+      if (pos.avgPrice == null && pos.entryPrice != null) {
+        pos.avgPrice = pos.entryPrice;
+        pos.firstDate = pos.firstDate || pos.entryDate;
+        delete pos.entryPrice;
+        delete pos.entryDate;
+      }
+      if (pos.lots == null) pos.lots = 1;
+      return pos;
+    });
+    return p;
+  }
+  return { balance: 100_000_000, positions: [], transactions: [] };
 }
 
 function savePortfolio(p) {
@@ -1021,6 +1079,8 @@ function savePortfolio(p) {
 }
 
 // ── Render Portfolio Tab ──
+let lastPrices = {};  // global: current prices (so sellPosition can use live price)
+
 async function loadPortfolio() {
   const porto = getPortfolio();
   const kodes = porto.positions.map(p => p.kode).join(',');
@@ -1034,6 +1094,7 @@ async function loadPortfolio() {
       if (d.ok) prices = d.data;
     } catch(e) {}
   }
+  lastPrices = prices;
 
   renderPortfolioUI(porto, prices);
 }
@@ -1041,17 +1102,17 @@ async function loadPortfolio() {
 function renderPortfolioUI(porto, prices) {
   const balance = porto.balance;
 
-  // Hitung total nilai posisi + P/L
+  // Hitung total nilai posisi + P/L (pakai avgPrice)
   let totalValue = 0;
   let totalCost = 0;
   porto.positions.forEach(pos => {
-    const currentPrice = prices[pos.kode] ? prices[pos.kode].harga : pos.entryPrice;
+    const currentPrice = prices[pos.kode] ? prices[pos.kode].harga : pos.avgPrice;
     pos._currentPrice = currentPrice;
     pos._marketValue = currentPrice * pos.lots * 100;
-    pos._pl = pos._marketValue - (pos.entryPrice * pos.lots * 100);
-    pos._plPct = ((currentPrice / pos.entryPrice - 1) * 100);
+    pos._pl = pos._marketValue - (pos.avgPrice * pos.lots * 100);
+    pos._plPct = ((currentPrice / pos.avgPrice - 1) * 100);
     totalValue += pos._marketValue;
-    totalCost += pos.entryPrice * pos.lots * 100;
+    totalCost += pos.avgPrice * pos.lots * 100;
   });
 
   const totalPL = totalValue - totalCost;
@@ -1095,13 +1156,13 @@ function renderPortfolioUI(porto, prices) {
     </div>`;
   } else {
     html += `<div class="porto-table-wrap"><table><thead><tr>
-      <th>#</th><th>Kode</th><th>Tgl Masuk</th><th>Harga Masuk</th><th>Lot</th>
+      <th>#</th><th>Kode</th><th>Tgl Masuk</th><th>Avg Cost</th><th>Lot</th>
       <th>Modal</th><th>Harga Now</th><th>Nilai Now</th><th>P/L (Rp)</th><th>P/L (%)</th>
       <th style="width:60px"></th>
     </tr></thead><tbody>`;
 
     porto.positions.forEach((pos, i) => {
-      const cp = pos._currentPrice || pos.entryPrice;
+      const cp = pos._currentPrice || pos.avgPrice;
       const plRp = pos._pl || 0;
       const plPct = pos._plPct || 0;
       const win = plRp >= 0;
@@ -1112,15 +1173,15 @@ function renderPortfolioUI(porto, prices) {
       html += `<tr>
         <td style="color:#999;">${i + 1}</td>
         <td style="font-weight:700;color:#1d4ed8;cursor:pointer;" onclick="searchSingle('${pos.kode}')">${pos.kode}</td>
-        <td style="font-size:10px;">${pos.entryDate}</td>
-        <td>Rp${pos.entryPrice.toLocaleString('id-ID')}</td>
+        <td style="font-size:10px;">${pos.firstDate || '—'}</td>
+        <td>Rp${pos.avgPrice.toLocaleString('id-ID')}</td>
         <td style="font-weight:700;">${pos.lots}</td>
-        <td>Rp${(pos.entryPrice * pos.lots * 100).toLocaleString('id-ID')}</td>
+        <td>Rp${(pos.avgPrice * pos.lots * 100).toLocaleString('id-ID')}</td>
         <td>Rp${cp.toLocaleString('id-ID')}<br><span style="font-size:9px;color:${chCol};">${chSign}${changePct}%</span></td>
         <td style="font-weight:600;">Rp${Math.round(pos._marketValue || 0).toLocaleString('id-ID')}</td>
         <td style="font-weight:700;color:${win ? '#059669' : '#dc2626'}">${win ? '+' : ''}Rp${Math.round(plRp).toLocaleString('id-ID')}</td>
         <td style="font-weight:700;color:${win ? '#059669' : '#dc2626'}">${win ? '+' : ''}${plPct.toFixed(2)}%</td>
-        <td><button style="padding:3px 8px;font-size:9px;border:1px solid #d4d4d4;background:#fff;border-radius:4px;cursor:pointer;color:#666;font-family:inherit;" onclick="removePosition(${i})">Jual</button></td>
+        <td><button style="padding:3px 8px;font-size:9px;border:1px solid #d4d4d4;background:#fff;border-radius:4px;cursor:pointer;color:#666;font-family:inherit;" onclick="sellPosition('${pos.kode}')">Jual</button></td>
       </tr>`;
     });
 
@@ -1131,16 +1192,56 @@ function renderPortfolioUI(porto, prices) {
     </div>`;
   }
 
+  // ── Transaction History ──
+  const txs = porto.transactions || [];
+  if (txs.length > 0) {
+    html += `<div class="overview-card" style="margin-top:12px;">
+      <div class="ov-header">Riwayat Transaksi</div>
+      <div class="porto-table-wrap"><table><thead><tr>
+        <th style="width:40px;">#</th><th>Tanggal</th><th>Aksi</th><th>Kode</th>
+        <th>Lot</th><th>Harga</th><th>Total</th>
+      </tr></thead><tbody>`;
+    txs.slice().reverse().forEach((tx, idx) => {
+      const aksiCol = tx.type === 'BUY' ? '#059669' : '#dc2626';
+      const total = tx.price * tx.lots * 100;
+      html += `<tr>
+        <td style="color:#999;">${idx + 1}</td>
+        <td style="font-size:10px;">${tx.date}</td>
+        <td style="font-weight:700;color:${aksiCol};">${tx.type}</td>
+        <td style="font-weight:700;color:#1d4ed8;">${tx.kode}</td>
+        <td>${tx.lots}</td>
+        <td>Rp${tx.price.toLocaleString('id-ID')}</td>
+        <td>Rp${total.toLocaleString('id-ID')}</td>
+      </tr>`;
+    });
+    html += '</tbody></table></div></div>';
+  }
+
   document.getElementById('main').innerHTML = html;
 }
 
-// ── Remove Position (Jual) ──
-function removePosition(idx) {
+// ── Sell Position (Jual) — merge average cost, log transaction ──
+function sellPosition(kode) {
   const porto = getPortfolio();
+  const idx = porto.positions.findIndex(p => p.kode === kode);
+  if (idx === -1) return;
   const pos = porto.positions[idx];
-  if (!pos) return;
-  // Return market value to balance
-  porto.balance += pos._marketValue || (pos.entryPrice * pos.lots * 100);
+  // Pakai harga live (lastPrices) kalau ada, fallback ke avgPrice
+  const live = lastPrices[kode] ? lastPrices[kode].harga : null;
+  const sellPrice = live || pos.avgPrice;
+  const proceeds = sellPrice * pos.lots * 100;
+
+  // Kredit hasil jual ke saldo
+  porto.balance += proceeds;
+  // Catat transaksi SELL
+  porto.transactions.push({
+    date: new Date().toISOString().slice(0, 10),
+    type: 'SELL',
+    kode: pos.kode,
+    lots: pos.lots,
+    price: sellPrice,
+  });
+  // Hapus posisi
   porto.positions.splice(idx, 1);
   savePortfolio(porto);
   loadPortfolio();
@@ -1231,12 +1332,34 @@ function confirmBuy(kode, harga) {
     return;
   }
   const today = new Date().toISOString().slice(0, 10);
-  porto.positions.push({
+
+  // ── Average cost: merge posisi kalau saham yang sama udah ada ──
+  const existing = porto.positions.find(p => p.kode === kode);
+  if (existing) {
+    const oldLots = existing.lots;
+    const oldCost = existing.avgPrice;
+    existing.lots = oldLots + lots;
+    // Weighted average cost
+    existing.avgPrice = Math.round((oldCost * oldLots + harga * lots) / existing.lots);
+    // firstDate tetap (tanggal pertama kali masuk)
+  } else {
+    porto.positions.push({
+      kode: kode,
+      firstDate: today,
+      avgPrice: harga,
+      lots: lots
+    });
+  }
+
+  // Catat transaksi BUY
+  porto.transactions.push({
+    date: today,
+    type: 'BUY',
     kode: kode,
-    entryDate: today,
-    entryPrice: harga,
-    lots: lots
+    lots: lots,
+    price: harga,
   });
+
   porto.balance -= total;
   savePortfolio(porto);
   document.getElementById('buyMsg').innerHTML = `<div class="buy-success">Berhasil membeli ${lots} lot ${kode}!</div>`;
@@ -1318,6 +1441,13 @@ function renderBacktest(d, show) {
     const tp2 = withFwd.filter(x => x.fwd.tp2_hit).length;
     const tp3 = withFwd.filter(x => x.fwd.tp3_hit).length;
 
+    // Risk metrics from backend summary (payoff ratio + max drawdown)
+    const sm = d.summary || {};
+    const payoff = (sm.payoff_ratio != null) ? sm.payoff_ratio : null;
+    const maxDD  = (sm.avg_max_dd_pct != null) ? sm.avg_max_dd_pct : null;
+    const payoffStr = (payoff == null) ? '—' : payoff;
+    const payoffCol = (payoff == null) ? '#aaa' : (payoff >= 1 ? '#059669' : '#dc2626');
+
     sumHtml += `
       <div class="bt-stat" style="border-left:3px solid #059669">
         <div class="bts-l">Win (${hz}H)</div>
@@ -1330,6 +1460,16 @@ function renderBacktest(d, show) {
       <div class="bt-stat" style="border-left:3px solid #8b5cf6">
         <div class="bts-l">TP1/2/3</div>
         <div class="bts-v" style="color:#8b5cf6;font-size:14px">${tp1}/${tp2}/${tp3}</div>
+      </div>
+      <div class="bt-stat" style="border-left:3px solid ${payoffCol}">
+        <div class="bts-l">Payoff</div>
+        <div class="bts-v" style="color:${payoffCol};font-size:16px">${payoffStr}</div>
+        <div style="font-size:9px;color:#aaa;">avg win/loss ratio</div>
+      </div>
+      <div class="bt-stat" style="border-left:3px solid #dc2626">
+        <div class="bts-l">Max DD</div>
+        <div class="bts-v" style="color:#dc2626;font-size:16px">${maxDD == null ? '—' : maxDD + '%'}</div>
+        <div style="font-size:9px;color:#aaa;">rata-rata drawdown</div>
       </div>`;
   }
   sumHtml += '</div>';
@@ -1343,7 +1483,7 @@ function renderBacktest(d, show) {
   let table = `<div class="bt-table-wrap"><table><thead><tr>
     <th>#</th><th>Kode</th><th>Skor</th><th>Harga</th>
     <th>Range Entry</th><th>Gaya</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>`;
-  if (show) table += '<th>Harga Akhir</th><th>Return</th><th>TP Hit</th>';
+  if (show) table += '<th>Harga Akhir</th><th>Return</th><th>Max DD</th><th>TP Hit</th>';
   table += '</tr></thead><tbody>';
 
   data.forEach((s, i) => {
@@ -1356,16 +1496,23 @@ function renderBacktest(d, show) {
       const f = (s.fwd && Object.keys(s.fwd).length > 0) ? s.fwd : null;
       if (f) {
         rc = f.win ? 'bw' : 'bl';
+        // ATR-based TP badges — show the actual per-stock target % used
+        const tp1Label = (f.tp1_pct != null) ? `TP1 +${f.tp1_pct}%` : 'TP1';
+        const tp2Label = (f.tp2_pct != null) ? `TP2 +${f.tp2_pct}%` : 'TP2';
+        const tp3Label = (f.tp3_pct != null) ? `TP3 +${f.tp3_pct}%` : 'TP3';
         const badges = [
-          f.tp1_hit ? '<span class="tp-hit">TP1</span>' : '<span class="tp-miss">TP1</span>',
-          f.tp2_hit ? '<span class="tp-hit">TP2</span>' : '<span class="tp-miss">TP2</span>',
-          f.tp3_hit ? '<span class="tp-hit">TP3</span>' : '<span class="tp-miss">TP3</span>',
+          f.tp1_hit ? `<span class="tp-hit">${tp1Label}</span>` : `<span class="tp-miss">${tp1Label}</span>`,
+          f.tp2_hit ? `<span class="tp-hit">${tp2Label}</span>` : `<span class="tp-miss">${tp2Label}</span>`,
+          f.tp3_hit ? `<span class="tp-hit">${tp3Label}</span>` : `<span class="tp-miss">${tp3Label}</span>`,
         ];
+        const dd = (f.max_dd_pct != null) ? f.max_dd_pct : null;
+        const ddCol = (dd == null) ? '#aaa' : (dd <= -5 ? '#dc2626' : '#f59e0b');
         oc = `<td><b>Rp${f.price_fwd.toLocaleString('id-ID')}</b><br><span style="font-size:9px;color:#888;">${f.end_date}</span></td>
               <td style="font-weight:700;color:${f.ret_pct >= 0 ? '#059669' : '#dc2626'}">${f.ret_pct >= 0 ? '+' : ''}${f.ret_pct}%</td>
+              <td style="font-weight:600;color:${ddCol}">${dd == null ? '—' : dd + '%'}</td>
               <td>${badges.join(' ')}</td>`;
       } else {
-        oc = '<td colspan="3" style="color:#999;font-size:10px;">Data tdk cukup</td>';
+        oc = '<td colspan="4" style="color:#999;font-size:10px;">Data tdk cukup</td>';
       }
     }
 

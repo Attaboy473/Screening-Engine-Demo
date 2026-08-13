@@ -89,6 +89,31 @@ TICKERS = POPULAR + [
 HISTORICAL_CACHE: dict[str, pd.DataFrame] = {}
 IHsgHISTORICAL: pd.DataFrame | None = None
 
+# --- TTL Cache for live API endpoints (reduces yfinance rate-limit pressure) ---
+# Screener/IHSG/prices are cached for a short window so rapid tab-switching
+# doesn't re-trigger 85 parallel downloads. Values auto-expire.
+import time as _time
+_TTL_CACHE: dict[str, tuple[float, int, dict]] = {}  # key -> (timestamp, ttl, value)
+_SCREENER_TTL = 300      # 5 minutes — batch screening is expensive (85 tickers)
+_IHSG_TTL = 60           # 1 minute — dashboard refresh
+_PRICES_TTL = 30         # 30 seconds — portfolio P/L "real-time" feel
+
+
+def _cache_get(key: str) -> dict | None:
+    """Return cached value if fresh, else None (and drop the stale entry)."""
+    entry = _TTL_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, ttl, val = entry
+    if _time.time() - ts > ttl:
+        _TTL_CACHE.pop(key, None)
+        return None
+    return val
+
+
+def _cache_set(key: str, value: dict, ttl: int) -> None:
+    _TTL_CACHE[key] = (_time.time(), ttl, value)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY: Safe float conversion (prevents NaN/Inf from breaking JSON)
@@ -311,7 +336,9 @@ def calc_scores(
         mom += 20
         m_details.append({"indikator": "Volume Spike", "signal": f"Vol naik {v5/v10:.1f}x vs baseline", "skor": 20, "max": 20})
     else:
-        m_details.append({"indikator": "Volume Spike", "signal": f"Vol normal ({v5/v10:.1f}x)", "skor": 0, "max": 20})
+        # Guard v10==0 (zero-volume period) — avoid division by zero
+        ratio = (v5 / v10) if v10 > 0 else 0.0
+        m_details.append({"indikator": "Volume Spike", "signal": f"Vol normal ({ratio:.1f}x)", "skor": 0, "max": 20})
 
     # Return 5-day / 20-day
     r5  = safe((close[-1] / close[-6]  - 1) * 100) if n >= 6  else 0
@@ -508,6 +535,9 @@ def calc_scores(
 @app.get("/api/ihsg")
 async def ihsg_api():
     """IHSG Dashboard — live market summary."""
+    cached = _cache_get("ihsg")
+    if cached is not None:
+        return cached
     try:
         df = yf.download("^JKSE", period="1y", progress=False, auto_adjust=True)
         if df.empty:
@@ -604,7 +634,7 @@ async def ihsg_api():
             "technical": f"{tech_icon} — {tech_outlook}",
         }
 
-        return {
+        result = {
             "ok": True,
             "ihsg": {
                 "harga": round(l), "change_pct": round(ch, 2), "status": st,
@@ -614,6 +644,8 @@ async def ihsg_api():
             "ihsg_chart": chart,
             "gainers": gain, "losers": loss,
         }
+        _cache_set("ihsg", result, _IHSG_TTL)
+        return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -663,6 +695,13 @@ async def screener_api(kodes: str = Query(None)):
     if not kodes:
         kodes = ",".join(TICKERS)
     tickers = [k.strip().upper() for k in kodes.split(",") if k.strip()]
+
+    # Cache key: full universe default vs explicit subset
+    cache_key = "screener:" + ",".join(sorted(tickers))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     results = []
 
     with ThreadPoolExecutor(6) as pool:
@@ -674,7 +713,9 @@ async def screener_api(kodes: str = Query(None)):
                 results.append(r)
 
     results.sort(key=lambda x: x.get("score", 0) if "score" in x else 0, reverse=True)
-    return {"ok": True, "count": len(results), "data": results}
+    payload = {"ok": True, "count": len(results), "data": results}
+    _cache_set(cache_key, payload, _SCREENER_TTL)
+    return payload
 
 
 def analyze_quick(kode: str) -> dict:
@@ -756,6 +797,12 @@ async def prices_api(kodes: str = Query(..., description="Kodes saham comma-sepa
     tickers = [k.strip().upper() for k in kodes.split(",") if k.strip()]
     if not tickers:
         return {"ok": True, "data": {}}
+
+    cache_key = "prices:" + ",".join(sorted(tickers))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     results = {}
     with ThreadPoolExecutor(6) as pool:
         futures = {}
@@ -782,7 +829,9 @@ async def prices_api(kodes: str = Query(..., description="Kodes saham comma-sepa
                 }
             except Exception:
                 pass
-    return {"ok": True, "data": results}
+    payload = {"ok": True, "data": results}
+    _cache_set(cache_key, payload, _PRICES_TTL)
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -854,7 +903,8 @@ async def backtest_dates():
 #      (NO look-ahead bias — fundamental data excluded for historical fairness)
 #   2. Filters for BUY signals (score ≥ 75 on 2-lane technique+momentum)
 #   3. Looks up forward return `horizon` days later
-#   4. Flags which TP levels (2%, 4%, 6%) were hit within the horizon
+#   4. Flags which ATR-based TP levels were hit within the horizon
+#      (same TP1=1x/TP2=1.8x/TP3=2.5x ATR logic as the live trading plan)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/backtest/screen")
@@ -907,11 +957,22 @@ async def backtest_screen(
             end_date    = fwd.index[horizon - 1]
             ret         = safe((fwd_close / eval_price - 1) * 100)
             max_price   = safe(fwd["High"].values[:horizon].max())
+            min_price   = safe(fwd["Low"].values[:horizon].min())
 
-            # Check if conservative TP levels were hit (2%, 4%, 6%)
-            tp1_hit = max_price >= eval_price * 1.02
-            tp2_hit = max_price >= eval_price * 1.04
-            tp3_hit = max_price >= eval_price * 1.06
+            # ── ATR-based TP hit check (SAME logic as live trading plan) ──
+            # calc_scores already computed tp1_pct/tp2_pct/tp3_pct from the ATR
+            # available at eval_date (no look-ahead). Hit when the max price
+            # within the horizon reaches the ATR-derived target.
+            tp1_pct = safe(r.get("tp1_pct", 0))
+            tp2_pct = safe(r.get("tp2_pct", 0))
+            tp3_pct = safe(r.get("tp3_pct", 0))
+            tp1_hit = tp1_pct > 0 and max_price >= eval_price * (1 + tp1_pct / 100)
+            tp2_hit = tp2_pct > 0 and max_price >= eval_price * (1 + tp2_pct / 100)
+            tp3_hit = tp3_pct > 0 and max_price >= eval_price * (1 + tp3_pct / 100)
+
+            # ── Risk metrics ──
+            # Max adverse drawdown: worst drop from entry price within horizon (%)
+            max_dd = safe((min_price / eval_price - 1) * 100) if eval_price > 0 else 0
 
             r["fwd"] = {
                 "price_fwd": round(fwd_close),
@@ -919,6 +980,13 @@ async def backtest_screen(
                 "ret_pct":   round(ret, 2),
                 "win":       ret > 0,
                 "max_price": round(max_price),
+                "min_price": round(min_price),
+                "max_dd_pct": round(max_dd, 2),
+                # ATR-based targets actually used (per-stock, not fixed %)
+                "tp1_pct": round(tp1_pct, 2),
+                "tp2_pct": round(tp2_pct, 2),
+                "tp3_pct": round(tp3_pct, 2),
+                "sl_pct":   round(safe(r.get("sl_pct", 0)), 2),
                 "tp1_hit":   tp1_hit, "tp2_hit": tp2_hit, "tp3_hit": tp3_hit,
             }
 
@@ -937,12 +1005,34 @@ async def backtest_screen(
             if len(fw2) >= horizon:
                 ihsg_ret = round(safe((safe(fw2["Close"].values[horizon - 1]) / ep2 - 1) * 100), 2)
 
+    # ── Aggregate risk metrics (payoff ratio, max drawdown) ──
+    summary = {}
+    with_fwd = [r for r in results if r.get("fwd")]
+    if with_fwd:
+        wins  = [r["fwd"] for r in with_fwd if r["fwd"].get("win")]
+        losses = [r["fwd"] for r in with_fwd if not r["fwd"].get("win")]
+        avg_win  = safe(sum(x["ret_pct"] for x in wins) / len(wins)) if wins else 0
+        avg_loss = safe(sum(x["ret_pct"] for x in losses) / len(losses)) if losses else 0
+        # Payoff ratio = avg win / |avg loss| (undefined if no losses yet)
+        payoff = round(avg_win / abs(avg_loss), 2) if avg_loss != 0 else None
+        # Average max adverse drawdown across all BUY signals
+        avg_max_dd = round(sum(x["fwd"]["max_dd_pct"] for x in with_fwd) / len(with_fwd), 2)
+        summary = {
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "avg_win_pct": round(avg_win, 2),
+            "avg_loss_pct": round(avg_loss, 2),
+            "payoff_ratio": payoff,
+            "avg_max_dd_pct": avg_max_dd,
+        }
+
     return {
         "date":    date,
         "horizon": horizon,
         "count":   len(results),
         "data":    results,
         "ihsg_return": ihsg_ret,
+        "summary": summary,
     }
 
 
