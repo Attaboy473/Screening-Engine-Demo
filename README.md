@@ -133,14 +133,16 @@ Input: Kode saham "BBCA"
 
 ## 📊 Hasil Backtest 2025
 
-| Metrik | Hasil |
-|--------|-------|
-| **TP1 Hit Rate** | **78.9%** |
-| **TP2 Hit Rate** | **56.3%** |
-| **Win Rate (BUY)** | **54.9%** |
-| **Observasi** | 2,184 data point |
+> **Catatan integritas:** Sejak v0.2, TP hit check di backtest memakai **ATR-based target** (TP1=1×ATR, TP2=1.8×ATR, TP3=2.5×ATR) — **identik** dengan logika trading plan live. Angka lama (78.9%) memakai fixed 2%/4%/6% yang tidak konsisten dengan trading plan, jadi sudah diganti. Hasil sekarang bervariasi per saham karena tiap emiten punya volatilitas (ATR) berbeda.
 
-> TP1 (target paling konservatif, 1× ATR) tercapai hampir **4 dari 5 kali**.
+| Metrik | Definisi |
+|--------|----------|
+| **Win Rate (BUY)** | % sinyal BUY dengan return positif di akhir horizon |
+| **TP1/TP2/TP3 Hit Rate** | % sinyal yang sempat menyentuh target ATR masing-masing |
+| **Payoff Ratio** | rata-rata win ÷ \|rata-rata loss\| (≥1 = menguntungkan) |
+| **Max Drawdown** | rata-rata penurunan terdalam dari harga masuk |
+
+> Semua metrik ini dihitung per tanggal eval di tab Backtest, bukan angka statis.
 
 ---
 
