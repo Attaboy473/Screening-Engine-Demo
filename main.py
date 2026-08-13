@@ -651,6 +651,63 @@ async def ihsg_api():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# API ENDPOINT: IHSG Chart (multi-range: Hari/Minggu/Bulan/Tahun)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Separate endpoint so the dashboard summary card stays cached while the chart
+# can be re-fetched at different granularities.
+#   hari   → 15m intraday (like Stockbit)
+#   minggu → 60m hourly
+#   bulan  → daily 1 month
+#   tahun  → daily 1 year
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CHART_RANGE_MAP = {
+    "hari":   {"period": "1d",  "interval": "15m", "ttl": 60},
+    "minggu": {"period": "5d",  "interval": "60m", "ttl": 300},
+    "bulan":  {"period": "1mo", "interval": "1d",  "ttl": 3600},
+    "tahun":  {"period": "1y",  "interval": "1d",  "ttl": 3600},
+}
+
+
+@app.get("/api/ihsg/chart")
+async def ihsg_chart_api(range: str = Query("hari", description="hari|minggu|bulan|tahun")):
+    """IHSG OHLCV chart data for the requested range/granularity."""
+    cfg = _CHART_RANGE_MAP.get(range.lower())
+    if cfg is None:
+        return {"ok": False, "error": f"Range '{range}' tidak valid. Gunakan hari|minggu|bulan|tahun"}
+
+    cache_key = f"ihsg_chart:{range.lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        df = yf.download("^JKSE", period=cfg["period"], interval=cfg["interval"],
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            return {"ok": False, "error": "Data IHSG kosong"}
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+
+        data = []
+        for idx, row in df.iterrows():
+            data.append({
+                "time":   int(pd.Timestamp(idx).timestamp()),
+                "open":   safe(float(row["Open"])),
+                "high":   safe(float(row["High"])),
+                "low":    safe(float(row["Low"])),
+                "close":  safe(float(row["Close"])),
+                "volume": safe(float(row["Volume"]), 0),
+            })
+        result = {"ok": True, "data": data, "range": range.lower()}
+        _cache_set(cache_key, result, cfg["ttl"])
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # API ENDPOINT: Single Stock Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
 

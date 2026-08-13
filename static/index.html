@@ -600,7 +600,15 @@ function renderDashboard(d) {
           </div>
         </div>
         <div class="ihsg-chart-card">
-          <div class="ihsg-chart-header">Grafik IHSG — 1 Tahun</div>
+          <div class="ihsg-chart-header">
+            <span>Grafik IHSG</span>
+            <div class="chart-tf">
+              <button class="active" onclick="switchIhsgRange('hari')">Hari</button>
+              <button onclick="switchIhsgRange('minggu')">Minggu</button>
+              <button onclick="switchIhsgRange('bulan')">Bulan</button>
+              <button onclick="switchIhsgRange('tahun')">Tahun</button>
+            </div>
+          </div>
           <div id="ihsgChart"></div>
         </div>
         ${renderOverview(ih)}
@@ -617,7 +625,7 @@ function renderDashboard(d) {
       </div>
     </div>
     <div class="tooltip">Data Yahoo Finance · delay 15 menit</div>`;
-  if (d.ihsg_chart && d.ihsg_chart.length) setTimeout(() => renderIhsgChart(d.ihsg_chart), 100);
+  if (d.ihsg_chart && d.ihsg_chart.length) setTimeout(() => renderIhsgChart(d.ihsg_chart, 'hari'), 100);
 }
 
 function renderOverview(ih) {
@@ -635,27 +643,55 @@ function renderOverview(ih) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // IHSG CHART (TradingView Lightweight Charts)
+// Multi-range: hari (15m intraday), minggu (60m), bulan (1d), tahun (1d)
 // ══════════════════════════════════════════════════════════════════════════
-function renderIhsgChart(data) {
+let ihsgRange = 'hari';
+
+async function switchIhsgRange(range) {
+  ihsgRange = range;
+  // Update active button
+  const btns = document.querySelectorAll('.ihsg-chart-header .chart-tf button');
+  const map = {hari:'Hari', minggu:'Minggu', bulan:'Bulan', tahun:'Tahun'};
+  btns.forEach(b => b.classList.toggle('active', b.textContent === map[range]));
+  // Show mini loading state
+  const c = document.getElementById('ihsgChart');
+  if (c) c.innerHTML = '<div style="text-align:center;padding:60px;color:#999;font-size:12px;">Memuat grafik...</div>';
+  try {
+    const r = await fetch(`${API}/api/ihsg/chart?range=${range}`);
+    const d = await r.json();
+    if (d.ok && d.data && d.data.length) {
+      renderIhsgChart(d.data, range);
+    } else {
+      if (c) c.innerHTML = `<div style="text-align:center;padding:60px;color:#dc2626;font-size:12px;">${d.error || 'Data kosong'}</div>`;
+    }
+  } catch(e) {
+    if (c) c.innerHTML = '<div style="text-align:center;padding:60px;color:#dc2626;font-size:12px;">Gagal memuat grafik</div>';
+  }
+}
+
+function renderIhsgChart(data, range) {
   const c = document.getElementById('ihsgChart');
   if (!c) return;
   if (ihsgChart) { ihsgChart.remove(); ihsgChart = null; }
+  const isDaily = (range === 'bulan' || range === 'tahun');
   ihsgChart = LightweightCharts.createChart(c, {
     layout: { background: { color: '#ffffff' }, textColor: '#333' },
     grid: { vertLines: { color: '#f0f0f0' }, horzLines: { color: '#f0f0f0' } },
     rightPriceScale: { borderColor: '#e0e0e0', scaleMargins: { top: .05, bottom: .05 } },
-    timeScale: { borderColor: '#e0e0e0', timeVisible: false },
+    timeScale: { borderColor: '#e0e0e0', timeVisible: !isDaily, secondsVisible: false },
   });
   const area = ihsgChart.addAreaSeries({
     lineColor: '#059669', topColor: 'rgba(5,150,105,0.12)',
     bottomColor: 'rgba(5,150,105,0.01)', lineWidth: 2,
   });
   area.setData(data.map(d => ({ time: d.time, value: d.close })));
-  // Overlay MA20 and MA50
-  const m20 = MA(data, 20);
-  if (m20.length) ihsgChart.addLineSeries({ color: '#1d4ed8', lineWidth: 1, lastValueVisible: false }).setData(m20);
-  const m50 = MA(data, 50);
-  if (m50.length) ihsgChart.addLineSeries({ color: '#f59e0b', lineWidth: 1, lastValueVisible: false }).setData(m50);
+  // Overlay MA20/MA50 only on daily ranges (intraday MA is misleading)
+  if (isDaily && data.length >= 50) {
+    const m20 = MA(data, 20);
+    if (m20.length) ihsgChart.addLineSeries({ color: '#1d4ed8', lineWidth: 1, lastValueVisible: false }).setData(m20);
+    const m50 = MA(data, 50);
+    if (m50.length) ihsgChart.addLineSeries({ color: '#f59e0b', lineWidth: 1, lastValueVisible: false }).setData(m50);
+  }
   ihsgChart.timeScale().fitContent();
 }
 
